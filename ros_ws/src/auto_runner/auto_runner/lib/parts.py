@@ -65,39 +65,50 @@ class MoveAction(EvHandle, Observer, Chainable):
         self.next_pos = None
         IMUData.subscribe(o=self)
 
+    # 정방향여부 판단
+    def _get_next_dir(self, orient: Orient, cur_pos: tuple, next_pos: tuple) -> DirType:
+        is_forward_orient_x = (orient == Orient.X and cur_pos[0] < next_pos[0]) or (
+            orient == Orient._X and cur_pos[0] > next_pos[0]
+        )
+        is_forward_orient_y = (orient == Orient.Y and cur_pos[1] < next_pos[1]) or (
+            orient == Orient._Y and cur_pos[1] > next_pos[1]
+        )
+        return (
+            DirType.FORWARD
+            if is_forward_orient_x or is_forward_orient_y
+            else DirType.BACKWARD
+        )
+
     def check_condition(self):
         path = self.path
-        if not path:
-            return False
-
         orient = self.orient
         cur_pos = self.cur_pos
-        (x0, y0), (x1, y1) = cur_pos, path[1]
-        output: bool = False
+        next_pos = path[1]
 
         if orient in [Orient.X, Orient._X]:
-            output = x0 != x1
+            if cur_pos[0] == next_pos[0]:
+                return False
+
         elif orient in [Orient.Y, Orient._Y]:
-            output = y0 != y1
+            if cur_pos[1] != next_pos[1]:
+                return False
 
-        if output == True:
-            self.action = DirType.FORWARD, orient
-            self.torque = 0.5
+        # 회전직전위치를 next_pos로 설정
+        ix = len(path) - 1
+        for index, pos in enumerate(path[1:], start=1):
+            if orient in [Orient.X, Orient._X]:
+                if pos[1] != cur_pos[1]:
+                    ix = index - 1
+                    break
+            elif orient in [Orient.Y, Orient._Y]:
+                if pos[0] != cur_pos[0]:
+                    ix = index - 1
+                    break
 
-            ix = len(path) - 1
-            for index, pos in enumerate(path[1:], start=1):
-                if orient in [Orient.X, Orient._X]:
-                    if pos[1] != y0:
-                        ix = index - 1
-                        break
-                elif orient in [Orient.Y, Orient._Y]:
-                    if pos[0] != x0:
-                        ix = index - 1
-                        break
-            # 회전 직적까지 후진
-            self.next_pos = path[ix]
+        self.next_pos = path[ix]
+        self.action = self._get_next_dir(orient, cur_pos, next_pos), orient
 
-        return output
+        return True
 
     def run(self):
         if state != State.ROTATE_STOP:
@@ -106,22 +117,27 @@ class MoveAction(EvHandle, Observer, Chainable):
             time.sleep(0.3)
             stop_event.clear()
 
+        next_pos = self.next_pos
+
         state.shift(State.RUN)
         while not stop_event.is_set():
             imu_data = self.get_msg().data
 
             with self._lock:
-                self.cur_pos = PathManage.transfer2_xy(imu_data[:2])
-                print_log(f"cur: {self.cur_pos} : dest: {self.next_pos}")
-
-                # 도착 여부 체크
-                if self.cur_pos == self.next_pos:
-                    break
-
-                _angle = imu_data[-1]
+                _cur_pos = imu_data[:2]
+                _angle = imu_data[2]
+                _next_pos = PathManage.transfer2_point(next_pos)
+                _next_dir = self.action[0]
                 _next_orient = self.action[1]
 
-                amend_theta: float = self._adjust_body(_next_orient, _angle)
+                # 도착 여부 체크
+                cur_pos = PathManage.transfer2_xy(_cur_pos)
+                print_log(f"cur: {cur_pos} : dest: {next_pos}")
+
+                if cur_pos == next_pos:
+                    break
+
+                amend_theta: float = self._adjust_body(_next_orient, _angle, _next_dir)
 
                 self._notifyall(
                     "node",
@@ -129,7 +145,12 @@ class MoveAction(EvHandle, Observer, Chainable):
                         title="move",
                         data_type="command",
                         data=dict(
-                            torque=self._pid_torque(imu_data[:2]), theta=amend_theta
+                            torque=self._pid_torque(
+                                cur_pos=_cur_pos,
+                                next_pos=_next_pos,
+                                direction=_next_dir,
+                            ),
+                            theta=amend_theta,
                         ),
                     ),
                 )
@@ -142,11 +163,15 @@ class MoveAction(EvHandle, Observer, Chainable):
         IMUData.unsubscribe(o=self)
 
     # PID제어를통한 torque 계산
-    def _pid_torque(self, cur_pos: tuple[float, float]) -> float:
+    def _pid_torque(
+        self,
+        cur_pos: tuple[float, float],
+        next_pos: tuple[float, float],
+        direction: DirType,
+    ) -> float:
         # 에러정의
         Kp, Ki, Kd, dt = 0.3, 0.03, 0.6, 3.0
         max_integral = 1.0
-        next_pos = PathManage.transfer2_point(self.next_pos)
 
         error = math.sqrt(
             (next_pos[0] - cur_pos[0]) ** 2 + (next_pos[1] - cur_pos[1]) ** 2
@@ -168,23 +193,16 @@ class MoveAction(EvHandle, Observer, Chainable):
         print_log(
             f"dynamic torque = {output}: {error=}, {self.integral_error=}, {derivative_error=}"
         )
-        return output
+        return output * (1 if direction == DirType.FORWARD else -1)
 
     # 수평상태
-    def _adjust_body(self, orient: Orient, angle: float):
+    def _adjust_body(self, orient: Orient, angle: float, direction: DirType):
         amend_theta: float = self._get_deviation_radian(orient, angle)
 
-        # 간격을 두어 보정한다.
-        # 잦은 조정에의한 좌우 흔들림 방지.
-        if abs(amend_theta) > 3 / 180 * math.pi:
-            # print_log(
-            #     f"[{self.dir_data.cur} 위치보정] {self.dir_data} >> 보정 각:{amend_theta} / 기준:{3 / 180 * math.pi}"
-            # )
-            pass
-        else:
+        if abs(amend_theta) <= 3 / 180 * math.pi:
             amend_theta = 0.0
 
-        return amend_theta * 0.8
+        return amend_theta * 0.8 * (1 if direction == DirType.FORWARD else -1)
 
     # 각도를 입력받아, 진행방향과 벗어난 각도를 반환한다.
     def _get_deviation_radian(self, orient: Orient, angle: float) -> float:
@@ -227,13 +245,12 @@ class RotateAction(EvHandle, Observer, Chainable):
 
     def setup(self, **kwargs):
         self.imu_data: list = None
+        self.integral_torque_error = 0
+        self.integral_theta_error = 0
         IMUData.subscribe(o=self)
 
     def check_condition(self):
         path = self.path
-        if not path:
-            return False
-
         orient = self.orient
         cur_pos = self.cur_pos
         (x0, y0), (x1, y1) = cur_pos, path[1]
@@ -263,10 +280,11 @@ class RotateAction(EvHandle, Observer, Chainable):
             elif x1 < x0:
                 action = DirType.RIGHT, Orient._X  # 우회전
 
-        if action is None:
-            return False
+        else:
+            raise Exception("Invalid orient")
 
         self.action = action
+        self.next_pos = path[1]
         return True
 
     def run(self):
@@ -275,12 +293,17 @@ class RotateAction(EvHandle, Observer, Chainable):
             time.sleep(0.3)
             stop_event.clear()
 
+        next_pos = self.next_pos
+
         state.shift(State.ROTATE_START)
 
         while not stop_event.is_set():
             imu_data = self.get_msg().data
 
             with self._lock:
+                next_dir = self.action[0]
+                _cur_pos = imu_data[:2]
+                _next_pos = PathManage.transfer2_point(next_pos)
                 _fr_angle = imu_data[-1]
                 _to_angle = self._get_target_angle()
 
@@ -291,15 +314,21 @@ class RotateAction(EvHandle, Observer, Chainable):
                 if abs(angle_diff) < self.rotate_policy[0]:
                     break
 
-                sign_ = 1 if self.action[0] == DirType.LEFT else -1
+                # sign_ = 1 if self.action[0] == DirType.LEFT else -1
                 self._notifyall(
                     "node",
                     Message(
                         data_type="command",
                         data=dict(
                             name="회전",
-                            torque=self.rotate_policy[1],
-                            theta=sign_ * 1.35,
+                            torque=self._pid_torque(
+                                cur_pos=_cur_pos, next_pos=_next_pos, direction=next_dir
+                            ),
+                            theta=self._pid_theta(
+                                cur_theta=_fr_angle,
+                                next_theta=_to_angle,
+                                direction=next_dir,
+                            ),
                         ),
                     ),
                 )
@@ -308,6 +337,71 @@ class RotateAction(EvHandle, Observer, Chainable):
 
         state.shift(State.ROTATE_STOP)
         IMUData.unsubscribe(o=self)
+
+    # PID제어를통한 torque 계산
+    def _pid_theta(
+        self, cur_theta: float, next_theta: float, direction: DirType
+    ) -> float:
+        # 에러정의
+        Kp, Ki, Kd, dt = 0.8, 0.03, 0.6, 8.0
+        max_integral = 0.5
+
+        error = next_theta - cur_theta
+        # 적분항이 발산
+        self.integral_theta_error = (
+            min(self.integral_torque_error + error, max_integral) / dt
+        )
+
+        derivative_error = (
+            error - (self.previous_error if self.previous_error else 0.0)
+        ) / dt
+
+        self.previous_error = error
+
+        if error <= 0.3:
+            self.integral_theta_error = 0  # 목표치에 근접할떄 적분항 리셋
+
+        output = Kp * error + Ki * self.integral_torque_error + Kd * derivative_error
+
+        print_log(
+            f"dynamic theta = {output}: {error=}, {self.integral_theta_error=}, {derivative_error=}"
+        )
+        return output * (1 if direction == DirType.FORWARD else -1)
+
+    # PID제어를통한 torque 계산
+    def _pid_torque(
+        self,
+        cur_pos: tuple[float, float],
+        next_pos: tuple[float, float],
+        direction: DirType,
+    ) -> float:
+        # 에러정의
+        Kp, Ki, Kd, dt = 0.8, 0.03, 0.6, 8.0
+        max_integral = 1.0
+
+        error = math.sqrt(
+            (next_pos[0] - cur_pos[0]) ** 2 + (next_pos[1] - cur_pos[1]) ** 2
+        )
+        # 적분항이 발산
+        self.integral_torque_error = (
+            min(self.integral_torque_error + error, max_integral) / dt
+        )
+
+        derivative_error = (
+            error - (self.previous_error if self.previous_error else 0.0)
+        ) / dt
+
+        self.previous_error = error
+
+        if error <= 1.0:
+            self.integral_torque_error = 0  # 목표치에 근접할떄 적분항 리셋
+
+        output = Kp * error + Ki * self.integral_torque_error + Kd * derivative_error
+
+        print_log(
+            f"dynamic torque = {output}: {error=}, {self.integral_torque_error=}, {derivative_error=}"
+        )
+        return output * (1 if direction == DirType.FORWARD else -1)
 
     # 목표 각도 설정
     def _get_target_angle(self) -> float:
@@ -328,177 +422,6 @@ class RotateAction(EvHandle, Observer, Chainable):
 
         print_log(f"rotate: {cur_angle} : {target_angle}")
         return target_angle - cur_angle
-
-
-class BackMoveAction(EvHandle, Observer, Chainable):
-    def __init__(self, orient: Orient, cur_pos: tuple, path: list[tuple]):
-        super().__init__()
-        self.orient = orient
-        self.cur_pos = cur_pos
-        self.path = path
-
-    def setup(self, **kwargs):
-        self.integral_error = 0
-        self.previous_error = None
-        self.next_pos = None
-        self.imu_data = None
-        IMUData.subscribe(o=self)
-
-    def _is_backward(self, cur_pos: tuple, next_pos: tuple, orient: Orient) -> bool:
-        x0, y0 = cur_pos
-        x1, y1 = next_pos
-        if orient == Orient.X:
-            return x0 > x1
-        elif orient == Orient._X:
-            return x0 < x1
-        elif orient == Orient.Y:
-            return y0 > y1
-        elif orient == Orient._Y:
-            return y0 < y1
-        else:
-            raise Exception("Wrong orient entered")
-
-    def check_condition(self):
-        path = self.path
-        orient = self.orient
-        cur_pos = self.cur_pos
-        next_pos = path[1]
-
-        output = self._is_backward(cur_pos, next_pos, orient)
-        if output == True:
-            self.action = DirType.BACKWARD, orient
-            x0, y0 = cur_pos
-            ix = len(path) - 1
-            for index, pos in enumerate(path[1:], start=1):
-                if orient in [Orient.X, Orient._X]:
-                    if pos[1] != y0:
-                        ix = index - 1
-                        break
-                elif orient in [Orient.Y, Orient._Y]:
-                    if pos[0] != x0:
-                        ix = index - 1
-                        break
-            # 회전 직적까지 후진
-            self.next_pos = path[ix]
-
-        return output
-
-    def run(self):
-        if state != State.ROTATE_STOP:
-            # 회전중이라면 회전을 중지시킨다.
-            self.stop_event.set()
-            time.sleep(0.3)
-            self.stop_event.clear()
-
-        state.shift(State.RUN)
-        while not self.stop_event.is_set():
-            imu_data = self.get_msg().data
-
-            with self._lock:
-                _xy = imu_data[:2]
-                # 도착 여부 체크
-                _dir = self.action[0]
-                if PathManage.transfer2_xy(_xy, _dir) == self.next_pos:
-                    break
-
-                _angle = self.imu_data[-1]
-                _next_orient = self.action[1]
-                amend_theta: float = self._adjust_body(_next_orient, _angle)
-
-                self._notifyall(
-                    "node",
-                    Message(
-                        title="후진",
-                        data_type="command",
-                        data=dict(
-                            torque=-self._pid_torque(imu_data[:2]), theta=-amend_theta
-                        ),
-                    ),
-                )
-
-        self._notifyall("node", Message(title="완료", data_type="notify", data="move"))
-
-        state.shift(State.ROTATE_STOP)
-        IMUData.unsubscribe(o=self)
-
-    # x,y,angle.z
-    def update(self, message: Message):
-        match message.data_type:
-            case "imu":
-                self.imu_data = message.data
-            case "map":
-                self.map_data = message.data
-
-    # 수평상태
-    def _adjust_body(self, orient: Orient, angle: float):
-        amend_theta: float = self._get_deviation_radian(orient, angle)
-
-        # 간격을 두어 보정한다.
-        # 잦은 조정에의한 좌우 흔들림 방지.
-        if abs(amend_theta) > 3 / 180 * math.pi:
-            # print_log(
-            #     f"[{self.dir_data.cur} 위치보정] {self.dir_data} >> 보정 각:{amend_theta} / 기준:{3 / 180 * math.pi}"
-            # )
-            pass
-        else:
-            amend_theta = 0
-
-        return amend_theta
-
-    # 각도를 입력받아, 진행방향과 벗어난 각도를 반환한다.
-    def _get_deviation_radian(self, orient: Orient, angle: float) -> float:
-        # 유니티에서 로봇의 기본회전상태가 180 CCW상태, 즉 음의 값.
-        # 회전방향 수치를 양수로 정리한다.
-        # -0.1 => 6.23
-        _angle = angle % (math.pi * 2)
-
-        if orient == Orient.X:
-            amend_theta = -_angle if _angle < math.pi / 2 else 2 * math.pi - _angle
-
-        elif orient == Orient._X:
-            amend_theta = math.pi - _angle
-
-        elif orient == Orient.Y:
-            # -180 ~ -270
-            # 차이량에 대해 음수면 바퀴가 우측방향으로 돌게된다. (우회전으로 보정)
-            amend_theta = math.pi / 2 - _angle
-
-        elif orient == Orient._Y:
-            amend_theta = math.pi * 3 / 2 - _angle
-
-        else:
-            amend_theta = 0.0
-
-        return amend_theta
-
-    # PID제어를통한 torque 계산
-    def _pid_torque(self, cur_pos: tuple[float, float]) -> float:
-        # 에러정의
-        Kp, Ki, Kd, dt = 0.3, 0.03, 0.6, 3.0
-        max_integral = 1.0
-        next_pos = PathManage.transfer2_point(self.next_pos)
-
-        error = math.sqrt(
-            (next_pos[0] - cur_pos[0]) ** 2 + (next_pos[1] - cur_pos[1]) ** 2
-        )
-
-        self.integral_error = min(self.integral_error + error, max_integral) / dt
-
-        derivative_error = (
-            error - (self.previous_error if self.previous_error else 0.0)
-        ) / dt
-
-        self.previous_error = error
-
-        if error <= 1.0:
-            self.integral_error = 0  # 오차가 매우 작을 때 적분항 리셋
-
-        output = Kp * error + Ki * self.integral_error + Kd * derivative_error
-
-        print_log(
-            f"dynamic torque = {output}: {error=}, {self.integral_error=}, {derivative_error=}"
-        )
-        return output
 
 
 # 다음 처리방향을 세운다.
